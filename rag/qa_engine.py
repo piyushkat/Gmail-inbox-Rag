@@ -4,7 +4,7 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 
 # Groq API setup
-GROQ_API_KEY = "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"
+GROQ_API_KEY = ""
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 def ask_question_with_groq(question, client):
