@@ -1,16 +1,20 @@
-import json
+import os
 import requests
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 
 # Groq API setup
-GROQ_API_KEY = "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"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+def get_embedding_model():
+    """Initialize and return the sentence transformer model."""
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 def ask_question_with_groq(question, client):
     """Query the vector database with a question and generate an answer using Groq API."""
     with st.spinner("Searching emails and generating answer..."):
-        embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+        embed_model = get_embedding_model()
         
         # Use the provided client to get the collection
         collection = client.get_collection("email_collection")
@@ -78,4 +82,4 @@ def ask_question_with_groq(question, client):
     return {
         "answer": answer,
         "sources": [{"metadata": meta, "excerpt": doc[:200] + "..."} for doc, meta in zip(relevant_docs, metadatas)]
-    }   
+    }
