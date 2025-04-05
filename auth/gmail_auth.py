@@ -1,10 +1,10 @@
 import os
 import pickle
 import json
-import streamlit as st
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+import streamlit as st
 
 # Gmail API setup
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']

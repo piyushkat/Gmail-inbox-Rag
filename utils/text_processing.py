@@ -19,7 +19,6 @@ def clean_text(text):
     text = re.sub(r'\d+', '', text)
     
     # Remove extra whitespace
-    text = re.sub(r'\s+', ' ', text)
-    text = text.strip()
+    text = re.sub(r'\s+', ' ', text).strip()
     
     return text

@@ -1,16 +1,17 @@
 import os
-import re
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import streamlit as st
+import re
+from collections import Counter
+import nltk
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
 from wordcloud import WordCloud
-import nltk
+import streamlit as st
 
-# Ensure NLTK resources are downloaded
+# Ensure necessary NLTK resources are downloaded
 nltk.download('stopwords', quiet=True)
 nltk.download('punkt', quiet=True)
 

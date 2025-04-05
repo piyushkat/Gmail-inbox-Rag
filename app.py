@@ -4,13 +4,28 @@ torch.classes.__path__ = []
 import os
 import pandas as pd
 import streamlit as st
+import time
+import threading
+import schedule
 import chromadb
+from dotenv import load_dotenv
+
+# Import functions from our modules
 from auth.gmail_auth import authenticate_gmail
-from data.email_fetcher import get_emails
-from data.vectordb import create_vector_database
+from data.email_fetcher import get_emails, fetch_new_emails
+from data.vectordb import create_vector_database, update_vector_database
 from analytics.email_eda import perform_eda
 from rag.qa_engine import ask_question_with_groq
 from utils.text_processing import clean_text
+
+# Load environment variables
+load_dotenv()
+
+def scheduler_thread():
+    """Background thread to run the scheduler."""
+    while st.session_state.get('scheduler_running', False):
+        schedule.run_pending()
+        time.sleep(1)
 
 def streamlit_app():
     """Main Streamlit application."""
@@ -42,8 +57,12 @@ def streamlit_app():
         st.session_state.eda_done = False
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
-    if 'current_view' not in st.session_state:
-        st.session_state.current_view = "qa"  # Default view is the Q&A interface
+    if 'last_email_date' not in st.session_state:
+        st.session_state.last_email_date = None
+    if 'scheduler_running' not in st.session_state:
+        st.session_state.scheduler_running = False
+    if 'scheduler_thread' not in st.session_state:
+        st.session_state.scheduler_thread = None
     
     # Sidebar for authentication and data loading
     with st.sidebar:
@@ -74,108 +93,188 @@ def streamlit_app():
                 if emails:
                     st.session_state.emails_df = pd.DataFrame(emails)
                     st.session_state.emails_df['clean_body'] = st.session_state.emails_df['body'].apply(clean_text)
-                    st.success(f"✅ Loaded {len(emails)} emails")
-                else:
-                    st.error("Failed to fetch emails")
+                    
+                    # Set the last email date for future fetches
+                    if 'date' in st.session_state.emails_df.columns:
+                        max_date = pd.to_datetime(st.session_state.emails_df['date'], errors='coerce').max()
+                        if pd.notna(max_date):
+                            st.session_state.last_email_date = max_date
+                            st.info(f"Last email date recorded: {max_date}")
         elif st.session_state.emails_df is not None:
-            st.success(f"✅ Loaded {len(st.session_state.emails_df)} emails")
+            st.success(f"✅ {len(st.session_state.emails_df)} emails loaded")
+            
+            # Button to fetch new emails
+            if st.button("Fetch New Emails"):
+                progress_bar = st.progress(0)
+                new_emails = get_emails(st.session_state.service, 
+                                      progress_bar=progress_bar, 
+                                      after_date=st.session_state.last_email_date)
+                if new_emails:
+                    new_emails_df = pd.DataFrame(new_emails)
+                    new_emails_df['clean_body'] = new_emails_df['body'].apply(clean_text)
+                    
+                    # Update the DataFrame
+                    combined_df = pd.concat([st.session_state.emails_df, new_emails_df])
+                    st.session_state.emails_df = combined_df.drop_duplicates(subset=['id'], keep='last').reset_index(drop=True)
+                    
+                    # Update the vector database with new emails
+                    if st.session_state.get('vector_db_created', False):
+                        success = update_vector_database(new_emails_df, st.session_state.vector_db)
+                        if success:
+                            st.success("Vector database updated with new emails")
+                        else:
+                            st.error("Failed to update vector database")
+                    
+                    # Update the last email date
+                    if len(new_emails_df) > 0 and 'date' in new_emails_df.columns:
+                        max_date = pd.to_datetime(new_emails_df['date'], errors='coerce').max()
+                        if pd.notna(max_date):
+                            st.session_state.last_email_date = max_date
+                            st.info(f"Updated last email date to {max_date}")
+                    
+                    st.success(f"Added {len(new_emails)} new emails")
+                else:
+                    st.info("No new emails found")
+            
+            # Set up auto-refresh
+            st.header("Auto-Refresh Settings")
+            enable_auto_refresh = st.checkbox("Enable auto-refresh", value=st.session_state.get('scheduler_running', False))
+            
+            refresh_interval = st.selectbox(
+                "Refresh interval",
+                ["1 minute", "5 minutes", "15 minutes", "30 minutes", "1 hour"],
+                index=1  # Default to 5 minutes
+            )
+            
+            # Handle scheduler based on checkbox
+            if enable_auto_refresh != st.session_state.get('scheduler_running', False):
+                if enable_auto_refresh:
+                    # Start the scheduler
+                    st.session_state.scheduler_running = True
+                    
+                    # Clear any existing schedules
+                    schedule.clear()
+                    
+                    # Set up the schedule based on selected interval
+                    if refresh_interval == "1 minute":
+                        schedule.every(1).minutes.do(fetch_new_emails)
+                    elif refresh_interval == "5 minutes":
+                        schedule.every(5).minutes.do(fetch_new_emails)
+                    elif refresh_interval == "15 minutes":
+                        schedule.every(15).minutes.do(fetch_new_emails)
+                    elif refresh_interval == "30 minutes":
+                        schedule.every(30).minutes.do(fetch_new_emails)
+                    else:  # 1 hour
+                        schedule.every(1).hours.do(fetch_new_emails)
+                    
+                    # Start the scheduler thread
+                    st.session_state.scheduler_thread = threading.Thread(target=scheduler_thread)
+                    st.session_state.scheduler_thread.daemon = True
+                    st.session_state.scheduler_thread.start()
+                    
+                    st.success(f"Auto-refresh enabled with {refresh_interval} interval")
+                else:
+                    # Stop the scheduler
+                    st.session_state.scheduler_running = False
+                    st.info("Auto-refresh disabled")
         
-        # Vector DB creation
+        # Vector database section
         st.header("3. Create Vector Database")
-        if st.session_state.emails_df is not None:
-            if st.session_state.vector_db is None:
-                st.error("Chroma client not initialized. Please reset the app.")
-            elif not hasattr(st.session_state.vector_db, 'collection_created'):
+        if st.session_state.emails_df is not None and st.session_state.vector_db_initialized:
+            if not st.session_state.get('vector_db_created', False):
                 if st.button("Create Vector Database"):
                     progress_bar = st.progress(0)
-                    success = create_vector_database(st.session_state.emails_df, st.session_state.vector_db, progress_bar=progress_bar)
+                    success = create_vector_database(st.session_state.emails_df, st.session_state.vector_db, progress_bar)
                     if success:
-                        st.session_state.vector_db.collection_created = True
-                        st.success("✅ Vector database created")
+                        st.session_state.vector_db_created = True
+                        st.success("Vector database created successfully!")
                     else:
-                        st.error("Failed to create vector database")
+                        st.error("Failed to create vector database.")
             else:
-                st.success("✅ Vector database ready")
-        else:
-            st.info("Load emails first to create the vector database.")
-        
-        # Navigation section
-        st.header("4. Navigation")
-        if st.session_state.emails_df is not None:
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Q&A Interface"):
-                    st.session_state.current_view = "qa"
-                    st.rerun()
-            with col2:
-                if st.button("Analyze Emails"):
-                    st.session_state.current_view = "eda"
-                    st.session_state.eda_done = True
-                    st.rerun()
-        
-        # Reset application
-        st.header("5. Reset Application")
-        if st.button("Reset All"):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
+                st.success("✅ Vector database created")
+                
+                # Option to recreate database
+                if st.button("Recreate Vector Database"):
+                    progress_bar = st.progress(0)
+                    success = create_vector_database(st.session_state.emails_df, st.session_state.vector_db, progress_bar)
+                    if success:
+                        st.success("Vector database recreated successfully!")
+                    else:
+                        st.error("Failed to recreate vector database.")
     
     # Main content area
-    if st.session_state.current_view == "eda" and st.session_state.emails_df is not None:
-        # Display EDA results with back button
-        col1, col2, col3 = st.columns([1, 3, 1])
-        with col1:
-            if st.button("← Back to Q&A"):
-                st.session_state.current_view = "qa"
-                st.rerun()
+    if st.session_state.emails_df is not None:
+        # Tabs for different features
+        tab1, tab2 = st.tabs(["Email Analysis", "Email Search & Chat"])
         
-        # Perform email analysis
-        perform_eda(st.session_state.emails_df)
-    
-    # Q&A interface
-    elif st.session_state.current_view == "qa":
-        if st.session_state.vector_db is not None and hasattr(st.session_state.vector_db, 'collection_created'):
-            # Use columns to center the title and input box
-            col1, col2, col3 = st.columns([1, 3, 1])
-            with col2:
-                st.title("Ask Questions About Your Emails")
+        # Tab 1: Email Analysis
+        with tab1:
+            if not st.session_state.eda_done:
+                eda_results = perform_eda(st.session_state.emails_df)
+                if eda_results and 'sender_counts' in eda_results and eda_results['sender_counts'] is not None:
+                    st.session_state.sender_counts = eda_results['sender_counts']
+                st.session_state.eda_done = True
+            else:
+                if st.button("Refresh Analysis"):
+                    st.session_state.eda_done = False
+                    st.experimental_rerun()
+                else:
+                    eda_results = perform_eda(st.session_state.emails_df)
+        
+        # Tab 2: Email Search & Chat
+        with tab2:
+            st.header("Email Assistant", divider="rainbow")
+            
+            if not st.session_state.get('vector_db_created', False):
+                st.warning("Please create the vector database before using this feature.")
+            else:
+                st.markdown("**Ask a question about your emails:**")
+                user_question = st.text_input("Question:", key="rag_question")
                 
-                # Input box for questions with larger width
-                question = st.text_input("Ask a question about your emails:", key="question_input")
+                col1, col2 = st.columns([1, 5])
+                with col1:
+                    ask_button = st.button("Ask")
+                with col2:
+                    clear_button = st.button("Clear Chat")
                 
-                # Submit button
-                if st.button("Ask Question") and question:
-                    # Process the question and get an answer
-                    result = ask_question_with_groq(question, st.session_state.vector_db)
+                if clear_button:
+                    st.session_state.chat_history = []
+                    st.rerun()
+                
+                if ask_button and user_question:
+                    # Add user question to chat history
+                    st.session_state.chat_history.append({"role": "user", "content": user_question})
                     
-                    # Display answer
-                    st.subheader("Answer:")
-                    st.write(result["answer"])
+                    # Get answer from RAG system
+                    response = ask_question_with_groq(user_question, st.session_state.vector_db)
                     
-                    # Display sources
-                    st.subheader("Sources:")
-                    for i, source in enumerate(result["sources"]):
-                        with st.expander(f"Source {i+1}: {source['metadata']['subject']}"):
-                            st.write(f"From: {source['metadata']['from']}")
-                            st.write(f"Date: {source['metadata']['date']}")
-                            st.write("Excerpt:")
-                            st.write(source['excerpt'])
-                    
-                    # Store in chat history
-                    st.session_state.chat_history.append({"question": question, "result": result})
+                    # Add response to chat history
+                    st.session_state.chat_history.append({
+                        "role": "assistant", 
+                        "content": response["answer"],
+                        "sources": response["sources"]
+                    })
                 
                 # Display chat history
-                if st.session_state.chat_history:
-                    st.subheader("Previous Questions")
-                    for i, chat in enumerate(st.session_state.chat_history):
-                        with st.expander(f"Q: {chat['question']}"):
-                            st.write("A: " + chat['result']['answer'])
-        else:
-            # Welcome screen centered in the main area
-            col1, col2, col3 = st.columns([1, 3, 1])
-            with col2:
-                st.title("Gmail RAG System Setup")
-                st.info("Please complete the steps in the sidebar to set up your email analysis system.")
+                for message in st.session_state.chat_history:
+                    if message["role"] == "user":
+                        st.markdown(f"**You:** {message['content']}")
+                    else:
+                        st.markdown(f"**Assistant:** {message['content']}")
+                        
+                        # Show sources if available
+                        if "sources" in message:
+                            with st.expander("View Sources"):
+                                for i, source in enumerate(message["sources"]):
+                                    meta = source["metadata"]
+                                    st.markdown(f"**Email {i+1}**")
+                                    st.markdown(f"**From:** {meta['from']}")
+                                    st.markdown(f"**Date:** {meta['date']}")
+                                    st.markdown(f"**Subject:** {meta['subject']}")
+                                    st.markdown(f"**Excerpt:** {source['excerpt']}")
+                                    st.markdown("---")
+                    
+                    st.markdown("---")
 
 if __name__ == "__main__":
     streamlit_app()
